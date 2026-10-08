@@ -2,7 +2,7 @@
 ## Physics-only model (ctr-sim)
 A physics only Cartesian control model using the ctr-sim framework ([original git repo](https://github.com/JackyP1937/ctr-sim))
 
-Code can be found under `ctr-sim`, and the main entrance script is `ctr_teleop.py`. It is necessary to install the python packages in `requirements.txt` and to also build and install the ctr-sim framework in that same directory. More info to install ctr-sim is in the `README.MD` in the subsequent directory.
+Code can be found under `ctr-sim`, and the main entrance script is `ctr_teleop.py`. It is necessary to install the python packages in `requirements.txt` and to also build and install the ctr-sim framework in that same directory. More info to install ctr-sim is in the `README.MD` in the original git repo. `ctr-sim` is NOT included in this github repo.
 
 Movement is controlled through either keyboard input or through a game controller input, and current tube configurations, along with initial rotation and movement of tubes, are stored inside the main script and are up to date. 
 
@@ -19,7 +19,7 @@ Currently (**10/06/26**), due to an implementation error or configuration error,
 
 **ctr-sim teleop GUI**
 
-![ctr-sim teleop gui image](ctr-sim-gui.png)
+![ctr-sim teleop gui image](media/ctr-sim-gui.png)
 
 ## Physics Informed Model
 ###### (Last update Oct. 1; Not currently in progress)
