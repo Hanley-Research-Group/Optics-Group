@@ -2,11 +2,17 @@
 ## Physics-only model (ctr-sim)
 A physics only Cartesian control model using the ctr-sim framework ([original git repo](https://github.com/JackyP1937/ctr-sim))
 
-Code can be found under `ctr-sim`, and the main entrance script is `ctr_teleop.py`. It is necessary to install the python packages in `requirements.txt` and to also build and install the ctr-sim framework in that same directory. More info to install ctr-sim is in the `README.MD` in the original git repo. `ctr-sim` is NOT included in this github repo.
+Code can be found under `ctr-sim`, and the main entrance script is `ctr-controlv1.py` or `ctr-controlv2.py`. It is necessary to install the python packages in `requirements.txt` and to also build and install the ctr-sim framework in that same directory. More info to install ctr-sim is in the `README.MD` in the original git repo. `ctr-sim` is NOT included in this github repo.
 
-Movement is controlled through either keyboard input or through a game controller input, and current tube configurations, along with initial rotation and movement of tubes, are stored inside the main script and are up to date. 
+Movement is controlled through either keyboard input or through a game controller input, and current tube configurations, along with initial rotation and movement of tubes, are stored inside the main script and are up to date. `ctr-controlv2.py` moves more and has control for independent tubes, but seems to move slightly more randomly than `ctr-controlv1.py`. 
 
-Currently (**10/06/26**), due to an implementation error or configuration error, the script does not accurately predict where it goes.
+###### Update: 10/15/26
+Homing and anti collision was added to a new script. Along with fixing the bugs of the precurvature being off, correct steps for 1mm of movement, and correct translation for rads to degrees for the calculations to motor translation. Added motor translation function translates the ctr-sim calculations to proper movement for the motors. 
+
+**Picture of tubes homed:**
+![tubes homed](media/tubes-homed.jpeg)
+
+
 ## 
 #### ctr-sim notes:
 * Whenever changing the tubes or setting up new ones, it is nessary to find the precurvature of the tubes. If they are unknown a script found at `ctr-sim/precurvature/measure_precurvature.py` is used to take a straight down picture of the tube, and find the precurvature of the model. You must select the points of the bend to find it accurately, and an aruco tag of 60mm must be placed near the tube for reference.
@@ -22,7 +28,7 @@ Currently (**10/06/26**), due to an implementation error or configuration error,
 ![ctr-sim teleop gui image](media/ctr-sim-gui.png)
 
 ## Physics Informed Model
-###### (Last update Oct. 1; Not currently in progress)
+###### (Last update Oct. 15th)
 An attempt to create a physics informed neural network was created. Aruco tags on the base of the robot and on the tip were used to train the robot, both before running it live, and during. A GUI showed the "predicted" path based on where you indicated to move the tip.
 
 Although a PIF neural network in the long term could lead to more precise results, the current implementation did not properly work and movement was unpredictable. This may be due to unrefined parameters, illogical code, an incorrect physics model, or any combination of the three.
@@ -30,6 +36,12 @@ Although a PIF neural network in the long term could lead to more precise result
 ![PIF gui](media/pif-gui.png)
 
 Code can be found in the `pif-controller` directory, with the entrance script being `main.py`. More info about aruco marker code is below.
+
+###### Update: 10/15/26
+Additionally, a version of the ctr-sim physics informed model is included named `ctr-control-piml.py` under the `ctr-sim` directory. It also uses aruco markers, however it is untested. A list of commands with it is included below:
+
+![PIF gui](media/ctr-sim-pifl-controls.png)
+
 
 ## Aruco Markers 
 ###### (Last update Sept. 28; Not currently in progress)
