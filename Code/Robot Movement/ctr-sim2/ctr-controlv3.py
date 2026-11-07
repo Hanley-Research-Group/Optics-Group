@@ -103,7 +103,7 @@ robot = ConcentricTubeRobot(
 
 # Tip speed while a key is held: cartesian_step metres per second
 # (each frame moves cartesian_step * frame time).
-cartesian_step = 1e-3  # 1 mm/s; adjust this for slower/faster speed
+cartesian_step = 1e-2  # 10 mm/s; adjust this for slower/faster speed
 sampling_ds = 1e-3
 
 hw = None # Robot
@@ -373,6 +373,202 @@ def solve_robot(torsion_initial_guess=None):
     return backbone, samples
 
 
+# ----------------------------------------------------------------------------
+# Live 3D view of the model
+# ----------------------------------------------------------------------------
+#
+# Drawn in a "physical" frame so it looks like the real robot from the side:
+#   horizontal axis  = insertion direction (base +z)
+#   depth axis       = sideways           (base +x)
+#   vertical axis    = up                 (base -y, since gravity is +y)
+
+VIEW_HZ = 10  # max redraw rate; drawing is slow compared to the 20 Hz input loop
+
+# The view runs in its own process. On macOS, a matplotlib window and the
+# pygame window in the same process share one Cocoa event loop, and matplotlib
+# swallows pygame's key-up events, so keys look "stuck" and the tube never
+# stops moving. A separate process gives each window its own event loop.
+
+
+class _ViewWindow:
+    """The matplotlib window itself. Lives only in the viewer process."""
+
+    TUBE_COLORS = ("tab:blue", "tab:orange", "tab:red")
+
+    def __init__(self, cfg):
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import FuncFormatter
+
+        self.closed = False
+        self.fig = plt.figure("CTR model", figsize=(7, 6))
+        self.fig.canvas.mpl_connect("close_event", self._on_close)
+        self.ax = ax = self.fig.add_subplot(111, projection="3d")
+
+        # Limits only grow (never shrink), so the view does not jump around.
+        self.reach = 0.0
+        self._fit(cfg["reach"])
+        ax.set_box_aspect((1, 1, 1))
+        ax.set_xlabel("insertion (mm)")
+        ax.set_ylabel("sideways x (mm)")
+        ax.set_zlabel("up (mm)")
+        mm = FuncFormatter(lambda v, _: f"{v * 1e3:.0f}")
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.set_major_formatter(mm)
+        ax.view_init(elev=15, azim=-80)     # roughly a side view
+
+        # Plexiglass / base plane at insertion = 0
+        g = np.array([-0.02, 0.02])
+        Y, Z = np.meshgrid(g, g)
+        ax.plot_surface(np.zeros_like(Y), Y, Z, alpha=0.08, color="k")
+
+        # Line widths roughly proportional to tube diameter
+        d0 = cfg["diameters"][0]
+        self.tube_lines = [
+            ax.plot([], [], [], lw=3 + 3 * d / d0, color=c, solid_capstyle="round", label=name)[0]
+            for name, d, c in zip(cfg["names"], cfg["diameters"], self.TUBE_COLORS)
+        ]
+        self.start_line = ax.plot([], [], [], ls="--", lw=1, color="gray", label="start pose")[0]
+        self.trail_line = ax.plot([], [], [], lw=1, color="tab:green", alpha=0.6, label="tip path")[0]
+        self.tip_dot = ax.plot([], [], [], "o", color="k", ms=5)[0]
+        self.text = ax.text2D(0.02, 0.98, "", transform=ax.transAxes, va="top", family="monospace", fontsize=8)
+        ax.legend(loc="upper right", fontsize=8)
+        self.trail = []
+
+    def _fit(self, needed):
+        """Make the cube big enough to hold `needed` metres from the base."""
+        if needed <= 0.85 * self.reach:
+            return
+        self.reach = max(0.04, 1.3 * needed)
+        half = self.reach / 2
+        self.ax.set_xlim(-0.005, self.reach)   # insertion
+        self.ax.set_ylim(-half, half)          # sideways
+        self.ax.set_zlim(-half, half)          # up
+
+    def _on_close(self, _event):
+        self.closed = True
+
+    @staticmethod
+    def _to_view(p):
+        p = np.asarray(p)
+        return p[:, 2], p[:, 0], -p[:, 1]   # insertion, sideways, up
+
+    def show(self, msg):
+        s, pos, ins = msg["s"], msg["pos"], msg["ins"]
+        lo = 0.0
+        for i, line in enumerate(self.tube_lines):
+            # Tube i is visible from the previous tube's tip to its own tip
+            mask = (s >= lo - 1e-9) & (s <= ins[i] + 1e-9)
+            line.set_data_3d(*self._to_view(pos[mask]))
+            lo = ins[i]
+
+        tip = pos[-1]
+        self._fit(max(tip[2], 2 * np.max(np.abs(pos[:, :2]))))
+        self.trail.append(tip)
+        self.trail = self.trail[-500:]
+        self.trail_line.set_data_3d(*self._to_view(np.array(self.trail)))
+        self.tip_dot.set_data_3d(*self._to_view(tip[None, :]))
+
+        rot = np.degrees(msg["rot"])
+        self.text.set_text(
+            "ins (mm) " + " ".join(f"{v * 1e3:7.2f}" for v in ins) + "\n"
+            "rot (deg)" + " ".join(f"{v:7.2f}" for v in rot) + "\n"
+            "tip (mm) " + " ".join(f"{v * 1e3:7.2f}" for v in tip)
+        )
+
+
+def _view_process(cfg, queue, ready):
+    """Entry point of the viewer process."""
+    import queue as queue_mod
+    import matplotlib.pyplot as plt
+
+    win = _ViewWindow(cfg)
+    plt.show(block=False)
+    win.fig.canvas.draw()
+    win.fig.canvas.start_event_loop(0.2)
+    ready.set()
+
+    import os
+    parent = os.getppid()
+    while not win.closed and os.getppid() == parent:   # exit if the main script dies
+        latest = None
+        try:
+            while True:                       # only draw the newest pose
+                msg = queue.get_nowait()
+                if msg is None:
+                    return
+                if msg["start"]:
+                    win.start_line.set_data_3d(*win._to_view(msg["pos"]))
+                latest = msg
+        except queue_mod.Empty:
+            pass
+        if latest is not None:
+            win.show(latest)
+            win.fig.canvas.draw_idle()
+        # Run this process's own event loop; unlike plt.pause() this does not
+        # raise the window, so it never steals focus from the pygame window.
+        win.fig.canvas.start_event_loop(1.0 / VIEW_HZ)
+
+
+class LiveView:
+    """Main-process handle: sends model poses to the viewer process."""
+
+    def __init__(self, robot):
+        import multiprocessing as mp
+        self.robot = robot
+        self.last_sent = 0.0
+        ctx = mp.get_context("spawn")
+        self.queue = ctx.Queue(maxsize=4)
+        ready = ctx.Event()
+        cfg = {
+            "names": [t.name for t in robot.tubes],
+            "diameters": [t.outer_diameter for t in robot.tubes],
+            "reach": float(robot.state.insertions[-1]),
+        }
+        self.proc = ctx.Process(target=_view_process, args=(cfg, self.queue, ready), daemon=True)
+        self.proc.start()
+        # Wait for the window so pygame opens after it and gets keyboard focus.
+        if not ready.wait(timeout=30):
+            print("3D view did not start in time; continuing without waiting.")
+
+    def _send(self, samples, start):
+        if not self.proc.is_alive():
+            return
+        msg = {
+            "start": start,
+            "s": np.asarray(samples.s),
+            "pos": np.asarray(samples.position),
+            "ins": np.array(self.robot.state.insertions, dtype=float),
+            "rot": np.array(self.robot.state.rotations, dtype=float),
+        }
+        try:
+            self.queue.put_nowait(msg)
+        except Exception:                     # queue full: viewer is behind, drop this frame
+            pass
+
+    def set_start(self, samples):
+        self._send(samples, start=True)
+        self.last_sent = time.monotonic()
+
+    def update(self, samples, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_sent < 1.0 / VIEW_HZ:
+            return
+        self.last_sent = now
+        self._send(samples, start=False)
+
+    def close(self):
+        try:
+            self.queue.put_nowait(None)
+        except Exception:
+            pass
+        self.proc.join(timeout=2)
+        if self.proc.is_alive():
+            self.proc.terminate()
+
+
+view = None  # LiveView, created in main unless --no-view
+
+
 def tip_position(guess=None):
     """Model tip position for the current robot.state (no backbone sampling)."""
     backbone = solve_forward_kinematics_v2(
@@ -517,6 +713,8 @@ def updateRobot(dx):
 
     backbone = new_backbone
     print("Tip:", np.round(samples.position[-1], 6))
+    if view is not None:
+        view.update(samples)
 
 
 def moveRobot(q_target):
@@ -544,6 +742,7 @@ def parse_args():
         help="mass attached to the tube tip, in grams (default: 0, no load). "
              "Its weight acts downward, i.e. opposite to the curve direction at rotation 0.",
     )
+    ap.add_argument("--no-view", action="store_true", help="don't open the live 3D model view")
     return ap.parse_args()
 
 
@@ -750,6 +949,12 @@ if __name__ == '__main__':
         print(f"Tip load: {ap.tip_mass_g:g} g, force {np.round(TIP_FORCE, 5)} N (base frame, +y = down).")
         print(f"Model tip moved by the load (mm): {np.round(sag * 1e3, 3)}")
 
+    # Open the model view before pygame so the pygame window ends up focused
+    # (the keys only register while the pygame window has focus).
+    if not ap.no_view:
+        view = LiveView(robot)
+        view.set_start(samples)
+
     hw = OctopusController(
         q0=np.concatenate([state.insertions, state.rotations]),
         port=ap.port, baud=ap.baud, live=ap.live,
@@ -782,3 +987,5 @@ if __name__ == '__main__':
         # Normal exit: finish queued moves and reset the tube angles.
         # Anything else (homing failure, error): quick-stop.
         hw.shutdown(emergency=not clean_exit)
+        if view is not None:
+            view.close()
