@@ -1,0 +1,103 @@
+import numpy as np
+
+from ctr_sim import (
+    Material,
+    Tube,
+    CTRState,
+    ConcentricTubeRobot,
+)
+
+from ctr_sim.mechanics import solve_forward_kinematics
+
+
+# ----------------------------------------
+# Materials
+# ----------------------------------------
+
+nitinol = Material(
+    name="Nitinol",
+    youngs_modulus=60e9,
+    shear_modulus=23e9,
+)
+
+fiber = Material(
+    name="SilicaFiber",
+    youngs_modulus=15e9,
+    shear_modulus=6.4e9,
+)
+
+
+# ----------------------------------------
+# Robot
+# ----------------------------------------
+
+outer = Tube(
+    name="OuterTube",
+    length=0.16,
+    precurvature=15.0,
+    outer_diameter=3.0e-3,
+    inner_diameter=2.8e-3,
+    material=nitinol,
+)
+
+middle = Tube(
+    name="MiddleTube",
+    length=0.18,
+    precurvature=10.0,
+    outer_diameter=2.0e-3,
+    inner_diameter=1.8e-3,
+    material=nitinol,
+)
+
+inner = Tube(
+    name="InnerTube",
+    length=0.20,
+    precurvature=0.0,
+    outer_diameter=1.6e-3,
+    inner_diameter=0.0,
+    material=fiber,
+)
+
+
+# ----------------------------------------
+# Robot state (Case 1)
+# ----------------------------------------
+
+state = CTRState(
+    insertions=[0.10, 0.12, 0.14],
+    rotations=[0.0, 0.0, 0.0],
+)
+
+robot = ConcentricTubeRobot(
+    tubes=[outer, middle, inner],
+    state=state,
+)
+
+
+# ----------------------------------------
+# Solve mechanics
+# ----------------------------------------
+
+solution = solve_forward_kinematics(robot)
+
+
+# ----------------------------------------
+# Results
+# ----------------------------------------
+
+print("\n========== MATLAB Validation: Case 1 ==========")
+
+print("\nTip Position")
+print(solution.tip_position)
+
+print("\nTip Rotation")
+print(solution.tip_rotation)
+
+print("\nArc Length Mesh")
+print(solution.s)
+
+print("\nTorsion")
+print(solution.torsion)
+
+print("\nCurvature")
+print(solution.curvature)

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ctr-sim"
+version = "0.1.0"
+description = "Simulation and control library for concentric tube robots."
+readme = "README.md"
+requires-python = ">=3.10"
+
+authors = [
+    {name = "Jack Peters"}
+]
+
+[tool.setuptools]
+packages = ["ctr_sim"]

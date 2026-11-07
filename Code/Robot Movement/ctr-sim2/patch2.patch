@@ -1,0 +1,1764 @@
+From b1af3a261c03050585e21f48fe449323015c713f Mon Sep 17 00:00:00 2001
+From: martino-dot <martin@blurrmc.com>
+Date: Thu, 5 Nov 2026 21:10:58 -0600
+Subject: [PATCH 1/2] Support tubes that are straight, then curved, then
+ straight
+
+A tube can now be defined by the length before the curve, the curve
+length, and the length after the curve (Tube.from_lengths, or the new
+optional length_before_curve / curve_length fields on Tube).
+
+- Tube: curve placement, validation, curvature_at(), curve_interval,
+  has_uniform_curvature. Tubes built the old way are unchanged (curved
+  over their whole length).
+- Segment: now carries the curvature of each active tube, since a tube
+  can be present but straight within a segment.
+- backbone_segments: also splits at the start and end of each tube's
+  curve, merges coincident boundaries (1e-12 m), and records
+  per-segment curvatures.
+- torsion_v2 / curvature: use the per-segment curvature instead of
+  Tube.precurvature. The torsion coupling formula itself is untouched.
+- V1 solve_forward_kinematics raises NotImplementedError for these
+  tubes instead of silently treating them as fully curved.
+- ROS simulator: robot defined by an editable TUBE_CONFIG table using
+  the three lengths (defaults reproduce the previous robot).
+- Example, docs, and 36 new tests.
+
+Uniformly curved robots give bit-identical results to before.
+---
+ README.md                                     |  37 +-
+ ctr_sim/kinematics/intervals.py               |  99 ++-
+ ctr_sim/mechanics/curvature.py                |   8 +-
+ ctr_sim/mechanics/forward.py                  |  14 +
+ ctr_sim/mechanics/torsion_v2.py               |  11 +-
+ ctr_sim/segment.py                            |  40 +-
+ ctr_sim/tube.py                               | 201 ++++-
+ docs/design.md                                |  27 +-
+ docs/roadmap.md                               |   2 +
+ examples/piecewise_tubes_example.py           | 161 ++++
+ .../ctr_teleop/ctr_teleop/ctr_simulator.py    | 131 ++--
+ tests/test_piecewise_tubes.py                 | 694 ++++++++++++++++++
+ 12 files changed, 1355 insertions(+), 70 deletions(-)
+ create mode 100644 examples/piecewise_tubes_example.py
+ create mode 100644 tests/test_piecewise_tubes.py
+
+diff --git a/README.md b/README.md
+index af4f8a2..aafda19 100644
+--- a/README.md
++++ b/README.md
+@@ -22,8 +22,9 @@ The demo shows live Xbox-controller teleoperation of the CTR tip in RViz. Indivi
+ 
+ - Material definitions with Young's and shear moduli
+ - Tube geometry, length, diameter, precurvature, insertion, and rotation
++- Straight / curved / straight tubes defined by the length before the curve, the curve length, and the length after the curve
+ - Multi-tube robot state representation
+-- Backbone segmentation at changing tube boundaries
++- Backbone segmentation at tube tips and at the start and end of every tube's curved section
+ - Segment-aware torsion solution
+ - Resultant backbone curvature computation
+ - Spatial backbone integration
+@@ -135,6 +136,39 @@ Backbone / tip pose
+ 
+ The torsion problem is solved using a shooting formulation with continuation when required. Previous torsion solutions are reused as initial guesses during interactive operation, substantially reducing the cost of nearby mechanics solves.
+ 
++## Tubes with Straight and Curved Sections
++
++A tube does not have to be curved along its whole length. Measured from its proximal (actuator) end to its distal tip, a tube can be straight, then curved at a fixed precurvature, then straight again:
++
++```text
++|<- length_before_curve ->|<-  curve_length  ->|<- length_after_curve ->|
++|        straight         |  curvature kappa   |        straight        |
++proximal end                                                       distal tip
++```
++
++Define such a tube from its three section lengths:
++
++```python
++tube = Tube.from_lengths(
++    name="MiddleTube",
++    length_before_curve=0.080,   # m
++    curve_length=0.045,          # m
++    length_after_curve=0.035,    # m
++    precurvature=22.0,           # 1/m, curved section only
++    outer_diameter=2.8e-3,
++    inner_diameter=2.1e-3,
++    material=nylon,
++)
++```
++
++The tube length is the sum of the three sections. The existing constructor still works: `Tube(name, length, precurvature, ...)` without the optional `length_before_curve` / `curve_length` arguments is a tube that is curved over its whole length, exactly as before.
++
++All sections of a tube have the same bending and torsional stiffness, so a straight section still stiffens the robot and transmits torsion; it just contributes no precurvature. The backbone is split into mechanics segments wherever a tube tip or a curve start/end lies in the free backbone, and the torsion and curvature solutions use each tube's curvature within each segment.
++
++See `examples/piecewise_tubes_example.py`. In the ROS 2 simulator the tubes are defined in the `TUBE_CONFIG` table at the top of `ctr_simulator.py`.
++
++Only the segment-aware V2 mechanics support these tubes; the original V1 pipeline raises `NotImplementedError` for them.
++
+ ## Cartesian Resolved-Rate Control
+ 
+ For robot configuration
+@@ -370,6 +404,7 @@ ctr-sim/
+ ## Known Limitations
+ 
+ - The current mechanics model focuses on unloaded CTR behavior; external contact and distributed environmental loads are not modeled.
++- Transitions between straight and curved sections are modeled as sharp (a step in precurvature), and tube rotation is imposed at the robot base (s = 0); torsional wind-up of tube material behind the base is not modeled.
+ - The numerical Jacobian requires multiple nonlinear forward solves and remains computationally expensive.
+ - Jacobian caching improves interactive performance but means some control updates use a Jacobian evaluated at a nearby configuration.
+ - The torsion shooting/continuation solver is not guaranteed to converge for arbitrary robot geometries or all finite-difference perturbations.
+diff --git a/ctr_sim/kinematics/intervals.py b/ctr_sim/kinematics/intervals.py
+index 01bde20..9d396ba 100644
+--- a/ctr_sim/kinematics/intervals.py
++++ b/ctr_sim/kinematics/intervals.py
+@@ -42,25 +42,84 @@ def occupied_intervals(
+     return intervals
+ 
+ 
++# Backbone boundaries closer together than this (m) are treated as one
++# boundary. This prevents numerically zero-length segments when, for
++# example, a curve boundary of one tube coincides with the tip or curve
++# boundary of another tube (or with the base, s = 0).
++_BOUNDARY_TOL = 1e-12
++
++
++def curved_intervals(
++    robot: ConcentricTubeRobot,
++) -> list[Interval]:
++    """
++    Compute the arc-length extent of each tube's curved section.
++
++    Each interval is returned in robot arc length s as
++
++        (curve_start, curve_end)
++
++    with
++
++        curve_start = βᵢ - Lᵢ + length_before_curve
++        curve_end   = curve_start + curve_length
++
++    Tubes with no curved section return a zero-length interval.
++    """
++
++    intervals = []
++
++    for tube, beta in zip(robot.tubes, robot.state.insertions):
++
++        sigma_start, sigma_end = tube.curve_interval
++
++        proximal = beta - tube.length
++
++        intervals.append(
++            (
++                proximal + sigma_start,
++                proximal + sigma_end,
++            )
++        )
++
++    return intervals
++
++
+ def backbone_segments(
+     robot: ConcentricTubeRobot,
+ ) -> list[Segment]:
+     """
+     Partition the robot backbone into contiguous segments.
+ 
+-    Within each segment, the set of active tubes remains constant.
++    Within each segment, the set of active tubes and the precurvature of
++    every active tube are constant. Segment boundaries are therefore
++    placed at
++
++        * the distal tip of every tube,
++        * the start and end of every tube's curved section, and
++        * the robot base (s = 0).
++
++    Tube material behind the base (s < 0) lies inside a rigid guide and
++    is not part of the free backbone.
+     """
+ 
+     intervals = occupied_intervals(robot)
++    curves = curved_intervals(robot)
+ 
+     # Collect all interval endpoints
+-    boundaries = set()
++    boundaries = []
+ 
+     for start, end in intervals:
+-        boundaries.add(start)
+-        boundaries.add(end)
++        boundaries.append(start)
++        boundaries.append(end)
+ 
+-    boundaries = sorted(boundaries)
++    for start, end in curves:
++
++        # A straight tube (or zero-length curve) has no curvature
++        # change to resolve.
++        if end - start > _BOUNDARY_TOL:
++            boundaries.append(start)
++            boundaries.append(end)
+ 
+     # The robot backbone begins at the robot base, s=0.
+     # Tube material behind the base remains inside a rigid guide and
+@@ -74,10 +133,27 @@ def backbone_segments(
+     # The free robot backbone begins at the base frame.
+     boundaries.append(0.0)
+ 
++    # The backbone ends at the most distal tube tip. Curved sections
++    # never extend past their own tube's tip, so clip any boundary
++    # that does only through round-off.
++    s_end = max(end for _, end in intervals)
++
+     boundaries = sorted(
+-        set(boundaries)
++        boundary
++        for boundary in boundaries
++        if boundary <= s_end + _BOUNDARY_TOL
+     )
+ 
++    # Merge boundaries that coincide to within tolerance.
++    merged = [boundaries[0]]
++
++    for boundary in boundaries[1:]:
++
++        if boundary - merged[-1] > _BOUNDARY_TOL:
++            merged.append(boundary)
++
++    boundaries = merged
++
+     segments = []
+ 
+     # Build each backbone segment
+@@ -89,6 +165,7 @@ def backbone_segments(
+         midpoint = (start + end) / 2
+ 
+         active_tubes = []
++        curvatures = []
+ 
+         for tube, (tube_start, tube_end) in zip(
+             robot.tubes,
+@@ -96,13 +173,23 @@ def backbone_segments(
+         ):
+ 
+             if tube_start <= midpoint <= tube_end:
++
+                 active_tubes.append(tube)
+ 
++                # Tube-local arc length of the segment midpoint,
++                # measured from the tube's proximal end.
++                sigma = midpoint - tube_start
++
++                curvatures.append(
++                    tube.curvature_at(sigma)
++                )
++
+         segments.append(
+             Segment(
+                 start=start,
+                 end=end,
+                 active_tubes=active_tubes,
++                curvatures=curvatures,
+             )
+         )
+ 
+diff --git a/ctr_sim/mechanics/curvature.py b/ctr_sim/mechanics/curvature.py
+index 9b7c0fe..0afdc69 100644
+--- a/ctr_sim/mechanics/curvature.py
++++ b/ctr_sim/mechanics/curvature.py
+@@ -90,7 +90,9 @@ def segment_curvature(
+         #
+         i = robot.tubes.index(tube)
+ 
+-        kappa = tube.precurvature
++        kappa = segment.curvatures[
++            segment.active_tubes.index(tube)
++        ]
+         theta_i = theta[i]
+ 
+         kx += tube.EI * kappa * np.cos(theta_i)
+@@ -133,7 +135,9 @@ def segment_curvature_v2(
+         segment.active_tubes
+     ):
+ 
+-        kappa = tube.precurvature
++        # Precurvature of this tube within the segment (zero where the
++        # tube is straight). Straight tubes still add to sum_EI.
++        kappa = segment.curvatures[i]
+ 
+         theta_i = theta[i]
+ 
+diff --git a/ctr_sim/mechanics/forward.py b/ctr_sim/mechanics/forward.py
+index 036dedd..75463da 100644
+--- a/ctr_sim/mechanics/forward.py
++++ b/ctr_sim/mechanics/forward.py
+@@ -18,8 +18,22 @@ def solve_forward_kinematics(
+ ) -> CTRSolution:
+     """
+     Solve the unloaded forward kinematics of a concentric tube robot.
++
++    This is the original (V1) sampled pipeline, which assumes every tube
++    has a single uniform precurvature. Tubes with a straight/curved/
++    straight profile are only supported by the segment-aware V2 pipeline
++    (ctr_sim.mechanics.forward_v2.solve_forward_kinematics_v2).
+     """
+ 
++    for tube in robot.tubes:
++
++        if not tube.has_uniform_curvature:
++            raise NotImplementedError(
++                f"Tube {tube.name} has a straight/curved profile, which "
++                "the V1 mechanics pipeline cannot represent. Use "
++                "solve_forward_kinematics_v2 instead."
++            )
++
+     bvp_solution = solve_torsion_bvp(robot)
+ 
+     s = np.arange(
+diff --git a/ctr_sim/mechanics/torsion_v2.py b/ctr_sim/mechanics/torsion_v2.py
+index d86b5ad..4687eea 100644
+--- a/ctr_sim/mechanics/torsion_v2.py
++++ b/ctr_sim/mechanics/torsion_v2.py
+@@ -43,8 +43,9 @@ def segment_torsion_ode(
+     """
+     Evaluate the torsion ODE within a single backbone segment.
+ 
+-    The active tube set is constant within a segment, so no
+-    tube-termination switching is required inside the ODE.
++    The active tube set and each tube's precurvature are constant
++    within a segment, so no tube-termination or curve-boundary
++    switching is required inside the ODE.
+ 
+     Parameters
+     ----------
+@@ -92,7 +93,9 @@ def segment_torsion_ode(
+ 
+         moment = 0.0
+ 
+-        kappa_i = tube_i.precurvature
++        # Precurvature of tube i within this segment. This is zero
++        # where the tube is straight, even though the tube is active.
++        kappa_i = segment.curvatures[i]
+ 
+         for j in range(n):
+ 
+@@ -105,7 +108,7 @@ def segment_torsion_ode(
+                 theta_index(j)
+             ]
+ 
+-            kappa_j = tube_j.precurvature
++            kappa_j = segment.curvatures[j]
+ 
+             moment += (
+                 tube_j.EI
+diff --git a/ctr_sim/segment.py b/ctr_sim/segment.py
+index 40f5c26..c2ab7b0 100644
+--- a/ctr_sim/segment.py
++++ b/ctr_sim/segment.py
+@@ -6,12 +6,46 @@ from ctr_sim.tube import Tube
+ @dataclass
+ class Segment:
+     """
+-    A contiguous interval of the backbone over which the set of active tubes
+-    remains constant.
++    A contiguous interval of the backbone over which both the set of
++    active tubes and the precurvature of every active tube remain
++    constant.
++
++    `curvatures[k]` is the precurvature (1/m) of `active_tubes[k]` over
++    this segment. A tube can be active in a segment while being straight
++    there (curvature 0): it still contributes bending and torsional
++    stiffness, but no precurvature.
++
++    If `curvatures` is omitted it defaults to each tube's `precurvature`,
++    which is only valid for tubes with uniform curvature; segments built
++    from tubes with a straight/curved/straight profile must supply it
++    (`backbone_segments` always does).
+     """
+ 
+     start: float
+     end: float
+     active_tubes: list[Tube]
++    curvatures: list[float] | None = None
++
++    def __post_init__(self):
++
++        if self.curvatures is None:
++
++            for tube in self.active_tubes:
++
++                if not tube.has_uniform_curvature:
++                    raise ValueError(
++                        f"Tube {tube.name} has a straight/curved "
++                        "profile, so the segment curvatures must be "
++                        "given explicitly."
++                    )
++
++            self.curvatures = [
++                tube.precurvature
++                for tube in self.active_tubes
++            ]
++
++        elif len(self.curvatures) != len(self.active_tubes):
+ 
+-    
+\ No newline at end of file
++            raise ValueError(
++                "curvatures must contain one value per active tube."
++            )
+diff --git a/ctr_sim/tube.py b/ctr_sim/tube.py
+index c23a81d..aa76081 100644
+--- a/ctr_sim/tube.py
++++ b/ctr_sim/tube.py
+@@ -2,6 +2,12 @@ from dataclasses import dataclass
+ from ctr_sim.material import Material
+ from math import pi
+ 
++
++# Tolerance (m) used when checking that the three tube sub-lengths add up
++# to the total tube length, and when deciding that a sub-length is zero.
++_LENGTH_TOL = 1e-12
++
++
+ @dataclass
+ class Tube:
+     """
+@@ -17,6 +23,33 @@ class Tube:
+ 
+     This class represents the physical tube only. It does not store the
+     tube's current insertion or rotation within a robot.
++
++    Precurvature profile
++    --------------------
++    Measured along the tube from its proximal end (the end at the
++    actuator) to its distal tip, the tube consists of three consecutive
++    sections:
++
++        |<- length_before_curve ->|<-  curve_length  ->|<- length_after_curve ->|
++        |        straight         |  curvature kappa   |        straight        |
++        proximal end                                                        distal tip
++
++    with
++
++        length = length_before_curve + curve_length + length_after_curve.
++
++    `precurvature` is the curvature (1/m) of the curved section only; the
++    straight sections have zero precurvature. All three sections have the
++    same cross-section and material, so every section has the same
++    bending stiffness EI and torsional stiffness GJ.
++
++    Backwards compatibility: if neither `length_before_curve` nor
++    `curve_length` is given, the whole tube is curved (the classic
++    uniformly precurved tube). A tube with `precurvature == 0` is
++    straight everywhere.
++
++    Use `Tube.from_lengths(...)` to define a tube directly from the
++    three section lengths.
+     """
+ 
+     name: str
+@@ -31,6 +64,15 @@ class Tube:
+ 
+     material: Material
+ 
++    length_before_curve: float = 0.0
++    """Straight length from the proximal end to the start of the curve (m)."""
++
++    curve_length: float | None = None
++    """
++    Length of the curved section (m). If omitted, the curve runs from the
++    end of the straight proximal section to the distal tip.
++    """
++
+     def __post_init__(self):
+         """Validate tube geometry."""
+ 
+@@ -59,6 +101,158 @@ class Tube:
+                 "Precurvature cannot be negative."
+             )
+ 
++        if self.length_before_curve < 0:
++            raise ValueError(
++                "length_before_curve cannot be negative."
++            )
++
++        if self.curve_length is None:
++            #
++            # Legacy behaviour: the curve extends to the distal tip.
++            #
++            self.curve_length = max(
++                0.0,
++                self.length - self.length_before_curve,
++            )
++
++        if self.curve_length < 0:
++            raise ValueError(
++                "curve_length cannot be negative."
++            )
++
++        if (
++            self.length_before_curve
++            + self.curve_length
++            > self.length + _LENGTH_TOL
++        ):
++            raise ValueError(
++                f"Tube {self.name}: length_before_curve "
++                f"({self.length_before_curve}) + curve_length "
++                f"({self.curve_length}) exceeds the tube length "
++                f"({self.length})."
++            )
++
++    @classmethod
++    def from_lengths(
++        cls,
++        name: str,
++        length_before_curve: float,
++        curve_length: float,
++        length_after_curve: float,
++        precurvature: float,
++        outer_diameter: float,
++        inner_diameter: float,
++        material: Material,
++    ) -> "Tube":
++        """
++        Construct a tube from the lengths of its three sections.
++
++        Parameters
++        ----------
++        length_before_curve : float
++            Straight length from the proximal end to the start of the
++            curve (m).
++        curve_length : float
++            Length of the curved section (m).
++        length_after_curve : float
++            Straight length from the end of the curve to the distal
++            tip (m).
++        precurvature : float
++            Curvature of the curved section (1/m).
++
++        The total tube length is the sum of the three section lengths.
++        """
++
++        if length_after_curve < 0:
++            raise ValueError(
++                "length_after_curve cannot be negative."
++            )
++
++        return cls(
++            name=name,
++            length=(
++                length_before_curve
++                + curve_length
++                + length_after_curve
++            ),
++            precurvature=precurvature,
++            outer_diameter=outer_diameter,
++            inner_diameter=inner_diameter,
++            material=material,
++            length_before_curve=length_before_curve,
++            curve_length=curve_length,
++        )
++
++    @property
++    def length_after_curve(self) -> float:
++        """Straight length from the end of the curve to the tip (m)."""
++        return max(
++            0.0,
++            self.length
++            - self.length_before_curve
++            - self.curve_length,
++        )
++
++    @property
++    def curve_interval(self) -> tuple[float, float]:
++        """
++        Extent of the curved section in tube-local arc length.
++
++        The tube-local coordinate sigma is measured from the tube's
++        proximal end (sigma = 0) to its distal tip (sigma = length).
++
++        Returns (sigma_start, sigma_end). If the tube has no curved
++        section (zero precurvature or zero curve length) both values
++        are equal.
++        """
++
++        if (
++            self.precurvature == 0.0
++            or self.curve_length <= _LENGTH_TOL
++        ):
++            return (
++                self.length_before_curve,
++                self.length_before_curve,
++            )
++
++        return (
++            self.length_before_curve,
++            self.length_before_curve + self.curve_length,
++        )
++
++    @property
++    def has_uniform_curvature(self) -> bool:
++        """
++        True if the precurvature is constant over the whole tube
++        (either curved over its entire length, or straight).
++        """
++
++        sigma_start, sigma_end = self.curve_interval
++
++        if sigma_start == sigma_end:
++            return True
++
++        return (
++            sigma_start <= _LENGTH_TOL
++            and sigma_end >= self.length - _LENGTH_TOL
++        )
++
++    def curvature_at(self, sigma: float) -> float:
++        """
++        Precurvature (1/m) at tube-local arc length sigma, measured
++        from the proximal end of the tube.
++
++        Points outside the tube (sigma < 0 or sigma > length) have
++        zero curvature.
++        """
++
++        sigma_start, sigma_end = self.curve_interval
++
++        if sigma_start <= sigma <= sigma_end and sigma_start < sigma_end:
++            return self.precurvature
++
++        return 0.0
++
+     @property
+     def I(self) -> float:
+         """Area moment of inertia (m^4)."""
+@@ -87,10 +281,3 @@ class Tube:
+     def wall_thickness(self) -> float:
+         """Tube wall thickness (m)"""
+         return (self.outer_diameter - self.inner_diameter) / 2
+-
+-    
+-
+-
+-
+-
+-    
+diff --git a/docs/design.md b/docs/design.md
+index 6c62685..eebd44e 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -84,10 +84,21 @@ Stores:
+ - precurvature;
+ - inner diameter;
+ - outer diameter;
+-- material.
++- material;
++- the position and extent of the curved section: `length_before_curve` and `curve_length`.
+ 
+ Derived mechanical quantities are computed from the tube geometry and material properties.
+ 
++A tube is a straight section, a curved section, and a straight section in sequence, measured from its proximal end:
++
++```text
++length = length_before_curve + curve_length + length_after_curve
++```
++
++`precurvature` is the curvature of the curved section only. `Tube.from_lengths(...)` builds a tube from the three lengths. Omitting `length_before_curve` and `curve_length` gives the original uniformly curved tube. Bending stiffness `EI` and torsional stiffness `GJ` are the same along the whole tube; only the precurvature varies.
++
++Tube-local arc length `sigma` runs from the proximal end (`sigma = 0`) to the tip (`sigma = L`). A tube point at robot arc length `s` has `sigma = s - (beta - L)`, and `Tube.curvature_at(sigma)` gives its precurvature.
++
+ A `Tube` contains physical properties but no current configuration state.
+ 
+ ### CTRState
+@@ -120,9 +131,11 @@ The robot is responsible for configuration and geometry validation.
+ 
+ ### Segment
+ 
+-Represents one contiguous backbone interval over which the active tube set is constant.
++Represents one contiguous backbone interval over which both the active tube set and the precurvature of every active tube are constant.
++
++A segment stores `active_tubes` and a parallel list `curvatures`. A tube can be active in a segment while straight there (curvature `0`): it still contributes `EI` and `GJ`, but no precurvature.
+ 
+-Tube proximal and distal boundaries partition the robot into these segments.
++Tube tips, the start and end of each tube's curved section, and the robot base partition the robot into segments.
+ 
+ ### SegmentSolution
+ 
+@@ -187,9 +200,9 @@ relative to the robot base.
+ 
+ ## Backbone Segmentation
+ 
+-Tube boundaries determine where the set of active tubes changes.
++Tube boundaries determine where the set of active tubes changes, and the start and end of each tube's curved section determine where a tube's precurvature changes.
+ 
+-The mechanics pipeline constructs contiguous backbone segments such that the active tube set remains constant within each segment.
++The mechanics pipeline constructs contiguous backbone segments such that the active tube set and every active tube's precurvature remain constant within each segment. Boundaries closer than 1e-12 m are merged, and boundaries behind the robot base (`s < 0`) are discarded, so a curve that starts inside the base guide begins the free backbone mid-curve.
+ 
+ Conceptually:
+ 
+@@ -264,7 +277,7 @@ During interactive operation, the previous successful torsion solution is reused
+ 
+ ### Curvature
+ 
+-Within each mechanics segment, the active tube set and solved tube angular state determine the resultant backbone curvature.
++Within each mechanics segment, the active tube set, each tube's precurvature in that segment, and the solved tube angular state determine the resultant backbone curvature. The bending stiffness of every active tube enters the normalization, including tubes that are straight in the segment.
+ 
+ Because the active tube set is constant within a segment, curvature is evaluated consistently with the local robot geometry.
+ 
+@@ -456,6 +469,8 @@ Notable limitations include:
+ - approximate Jacobian reuse between refreshes;
+ - shooting/continuation convergence is not guaranteed for arbitrary robot geometries;
+ - insertion constraints are applied after the unconstrained resolved-rate calculation;
++- straight/curved transitions are sharp (no gradual curvature transition);
++- tube rotation is imposed at the base, so torsional wind-up behind the base is not modeled;
+ - no hardware CTR interface;
+ - the Windows Xbox sender remains a separate process from the ROS 2 launch system.
+ 
+diff --git a/docs/roadmap.md b/docs/roadmap.md
+index f8923dd..dd8bc0e 100644
+--- a/docs/roadmap.md
++++ b/docs/roadmap.md
+@@ -21,6 +21,7 @@ This roadmap summarizes the major development milestones completed in the curren
+ - [x] Arc-length interval utilities
+ - [x] Backbone representation
+ - [x] Mechanics segment representation
++- [x] Straight / curved / straight tube geometry
+ 
+ ## Phase 3 - Forward Mechanics
+ 
+@@ -35,6 +36,7 @@ This roadmap summarizes the major development milestones completed in the curren
+ - [x] Dense continuous segment solutions
+ - [x] Warm-started torsion solves
+ - [x] Direct tip-state evaluation
++- [x] Curve-aware backbone segmentation, torsion, and curvature
+ 
+ ## Phase 4 - Cartesian Control
+ 
+diff --git a/examples/piecewise_tubes_example.py b/examples/piecewise_tubes_example.py
+new file mode 100644
+index 0000000..ff6e1b4
+--- /dev/null
++++ b/examples/piecewise_tubes_example.py
+@@ -0,0 +1,161 @@
++"""
++Concentric tube robot whose tubes are straight / curved / straight.
++
++Each tube is defined by the lengths of its three sections, measured from
++the proximal (actuator) end to the distal tip:
++
++    |<- length_before_curve ->|<- curve_length ->|<- length_after_curve ->|
++    |        straight         |   precurvature   |        straight        |
++
++All numbers below are PLACEHOLDERS. Replace the material properties,
++diameters, section lengths and precurvatures with your measured values.
++"""
++
++from ctr_sim import (
++    Material,
++    Tube,
++    CTRState,
++    ConcentricTubeRobot,
++)
++
++from ctr_sim.mechanics.forward_v2 import (
++    solve_forward_kinematics_v2,
++)
++
++from ctr_sim.mechanics.sampling import (
++    sample_backbone,
++)
++
++from ctr_sim.visualization import (
++    plot_backbone_samples,
++)
++
++
++# ----------------------------------------
++# Material  (placeholder nylon values)
++# ----------------------------------------
++
++nylon = Material(
++    name="Nylon",
++    youngs_modulus=2.7e9,
++    shear_modulus=1.0e9,
++)
++
++
++# ----------------------------------------
++# Tubes (outermost first)
++#
++# Tube.from_lengths(
++#     name,
++#     length_before_curve,   # straight, from the proximal end
++#     curve_length,          # curved section
++#     length_after_curve,    # straight, out to the distal tip
++#     precurvature,          # curvature of the curved section (1/m)
++#     outer_diameter,
++#     inner_diameter,
++#     material,
++# )
++# ----------------------------------------
++
++outer = Tube.from_lengths(
++    name="OuterTube",
++    length_before_curve=0.060,
++    curve_length=0.050,
++    length_after_curve=0.030,
++    precurvature=18.0,
++    outer_diameter=4.0e-3,
++    inner_diameter=3.2e-3,
++    material=nylon,
++)
++
++middle = Tube.from_lengths(
++    name="MiddleTube",
++    length_before_curve=0.080,
++    curve_length=0.045,
++    length_after_curve=0.035,
++    precurvature=22.0,
++    outer_diameter=2.8e-3,
++    inner_diameter=2.1e-3,
++    material=nylon,
++)
++
++inner = Tube.from_lengths(
++    name="InnerTube",
++    length_before_curve=0.100,
++    curve_length=0.040,
++    length_after_curve=0.040,
++    precurvature=25.0,
++    outer_diameter=1.8e-3,
++    inner_diameter=0.8e-3,
++    material=nylon,
++)
++
++
++# ----------------------------------------
++# Robot state
++#
++# insertion beta_i: how far tube i's distal tip is past the robot base.
++# 0 <= beta_i <= tube length.
++# ----------------------------------------
++
++state = CTRState(
++    insertions=[0.10, 0.14, 0.18],
++    rotations=[0.5, -1.0, 2.0],
++)
++
++robot = ConcentricTubeRobot(
++    tubes=[outer, middle, inner],
++    state=state,
++)
++
++
++# ----------------------------------------
++# Solve
++# ----------------------------------------
++
++backbone = solve_forward_kinematics_v2(robot)
++
++print("\nTube sections (m):")
++
++for tube in robot.tubes:
++    print(
++        f"  {tube.name:11s} before={tube.length_before_curve:.3f}  "
++        f"curve={tube.curve_length:.3f}  "
++        f"after={tube.length_after_curve:.3f}  "
++        f"total={tube.length:.3f}"
++    )
++
++print("\nMechanics segments "
++      "(tube curvatures within each, 1/m):")
++
++for i, solution in enumerate(backbone.segments):
++
++    segment = solution.segment
++
++    print(
++        f"  {i}: s=[{segment.start:.4f}, {segment.end:.4f}]  "
++        + ", ".join(
++            f"{tube.name}={kappa:g}"
++            for tube, kappa in zip(
++                segment.active_tubes,
++                segment.curvatures,
++            )
++        )
++    )
++
++samples = sample_backbone(
++    backbone,
++    ds=1e-3,
++)
++
++print("\nTip position (m):", samples.position[-1])
++
++
++# ----------------------------------------
++# Visualization
++# ----------------------------------------
++
++plot_backbone_samples(
++    samples,
++    robot,
++)
+diff --git a/ros2_ws/src/ctr_teleop/ctr_teleop/ctr_simulator.py b/ros2_ws/src/ctr_teleop/ctr_teleop/ctr_simulator.py
+index 57ddc16..1d45720 100644
+--- a/ros2_ws/src/ctr_teleop/ctr_teleop/ctr_simulator.py
++++ b/ros2_ws/src/ctr_teleop/ctr_teleop/ctr_simulator.py
+@@ -52,6 +52,65 @@ from ctr_sim.control.constraints import (
+ )
+ 
+ 
++#
++# Simulated robot definition.
++#
++# Every tube is described by the lengths of its three sections, measured
++# from the proximal end to the distal tip (all in metres):
++#
++#   length_before_curve   straight section
++#   curve_length          curved section (curvature = precurvature, 1/m)
++#   length_after_curve    straight section out to the tip
++#
++# The tube length is the sum of the three. A tube that is curved over its
++# whole length uses length_before_curve = 0 and length_after_curve = 0;
++# a straight tube uses precurvature = 0.
++#
++# Tubes are listed from outermost to innermost, and each tube must be
++# longer than the one outside it. Rebuild (colcon build) after editing.
++#
++# NOTE: these values reproduce the original uniformly-curved Nitinol
++# example robot. Replace them with the parameters of your tubes. The
++# materials available here are defined in create_robot().
++#
++TUBE_CONFIG = [
++    {
++        "name": "OuterTube",
++        "length_before_curve": 0.0,
++        "curve_length": 0.16,
++        "length_after_curve": 0.0,
++        "precurvature": 15.0,
++        "outer_diameter": 3.0e-3,
++        "inner_diameter": 2.8e-3,
++        "material": "nitinol",
++    },
++    {
++        "name": "MiddleTube",
++        "length_before_curve": 0.0,
++        "curve_length": 0.18,
++        "length_after_curve": 0.0,
++        "precurvature": 10.0,
++        "outer_diameter": 2.0e-3,
++        "inner_diameter": 1.8e-3,
++        "material": "nitinol",
++    },
++    {
++        "name": "InnerTube",
++        "length_before_curve": 0.0,
++        "curve_length": 0.20,
++        "length_after_curve": 0.0,
++        "precurvature": 0.0,
++        "outer_diameter": 1.6e-3,
++        "inner_diameter": 0.0,
++        "material": "fiber",
++    },
++]
++
++# Initial tube insertions (m) and rotations (rad), outermost first.
++INITIAL_INSERTIONS = [0.10, 0.145, 0.19]
++INITIAL_ROTATIONS = [np.pi / 2, 0.0, 0.0]
++
++
+ class CTRSimulator(Node):
+ 
+     def __init__(self):
+@@ -272,6 +331,9 @@ class CTRSimulator(Node):
+ 
+     def create_robot(self):
+ 
++        #
++        # Materials.
++        #
+         nitinol = Material(
+             name="Nitinol",
+             youngs_modulus=60e9,
+@@ -284,52 +346,39 @@ class CTRSimulator(Node):
+             shear_modulus=6.4e9,
+         )
+ 
+-        outer = Tube(
+-            name="OuterTube",
+-            length=0.16, 
+-            precurvature=15.0, 
+-            outer_diameter=3.0e-3,
+-            inner_diameter=2.8e-3,
+-            material=nitinol,
+-        )
+-
+-        middle = Tube(
+-            name="MiddleTube",
+-            length=0.18, 
+-            precurvature=10.0,
+-            outer_diameter=2.0e-3,
+-            inner_diameter=1.8e-3,
+-            material=nitinol,
+-        )
+-
+-        inner = Tube(
+-            name="InnerTube",
+-            length=0.20, 
+-            precurvature=0.0,
+-            outer_diameter=1.6e-3,
+-            inner_diameter=0.0,
+-            material=fiber,
+-        )
++        materials = {
++            "nitinol": nitinol,
++            "fiber": fiber,
++        }
++
++        #
++        # Tubes, outermost first. Each tube is straight for
++        # length_before_curve, curved (at `precurvature`) for
++        # curve_length, then straight for length_after_curve, measured
++        # from the tube's proximal end to its distal tip. The tube's
++        # total length is the sum of the three.
++        #
++        tubes = [
++            Tube.from_lengths(
++                name=cfg["name"],
++                length_before_curve=cfg["length_before_curve"],
++                curve_length=cfg["curve_length"],
++                length_after_curve=cfg["length_after_curve"],
++                precurvature=cfg["precurvature"],
++                outer_diameter=cfg["outer_diameter"],
++                inner_diameter=cfg["inner_diameter"],
++                material=materials[cfg["material"]],
++            )
++            for cfg in TUBE_CONFIG
++        ]
+ 
+         state = CTRState(
+-            insertions=[
+-                0.10, 
+-                0.145, 
+-                0.19, 
+-            ],
+-            rotations=[
+-                np.pi / 2, 
+-                0.0,
+-                0.0,
+-            ],
++            insertions=list(INITIAL_INSERTIONS),
++            rotations=list(INITIAL_ROTATIONS),
+         )
+ 
+         return ConcentricTubeRobot(
+-            tubes=[
+-                outer,
+-                middle,
+-                inner,
+-            ],
++            tubes=tubes,
+             state=state,
+         )
+ 
+diff --git a/tests/test_piecewise_tubes.py b/tests/test_piecewise_tubes.py
+new file mode 100644
+index 0000000..e0981d8
+--- /dev/null
++++ b/tests/test_piecewise_tubes.py
+@@ -0,0 +1,694 @@
++"""
++Tests for tubes whose precurvature is straight / curved / straight.
++
++Convention note: with this code base a positive body-frame curvature
++along +x bends the backbone toward -y (dR/ds = R [u]x).
++"""
++
++import numpy as np
++import pytest
++
++from ctr_sim import (
++    Material,
++    Tube,
++    CTRState,
++    ConcentricTubeRobot,
++    Segment,
++)
++from ctr_sim.kinematics.intervals import (
++    backbone_segments,
++    curved_intervals,
++)
++from ctr_sim.mechanics.forward_v2 import (
++    solve_forward_kinematics_v2,
++)
++from ctr_sim.mechanics.sampling import (
++    tip_position,
++)
++from ctr_sim.mechanics.torsion_v2 import (
++    torsion_shooting_residual,
++)
++from ctr_sim.mechanics.forward import (
++    solve_forward_kinematics,
++)
++from ctr_sim.control.jacobian import (
++    numerical_position_jacobian_v2,
++)
++from ctr_sim.control.resolved_rate import (
++    resolved_rate_step_v2,
++)
++from ctr_sim.control.constraints import (
++    constrain_joint_step,
++)
++
++# Integration uses scipy's default ODE tolerances, so positions are
++# accurate to about a micron.
++POS_TOL = 5e-6
++
++nylon = Material("Nylon", 2.7e9, 1.0e9)
++
++
++def rot_z(a):
++    return np.array([
++        [np.cos(a), -np.sin(a), 0.0],
++        [np.sin(a), np.cos(a), 0.0],
++        [0.0, 0.0, 1.0],
++    ])
++
++
++def three_piecewise_tubes():
++    return [
++        Tube.from_lengths(
++            "outer", 0.060, 0.050, 0.030, 18.0, 4.0e-3, 3.2e-3, nylon
++        ),
++        Tube.from_lengths(
++            "middle", 0.080, 0.045, 0.035, 22.0, 2.8e-3, 2.1e-3, nylon
++        ),
++        Tube.from_lengths(
++            "inner", 0.100, 0.040, 0.040, 25.0, 1.8e-3, 0.8e-3, nylon
++        ),
++    ]
++
++
++def reference_tip_equal_rotations(robot, n=200_000):
++    """
++    Independent reference for the tip when all tube rotations are equal
++    (no torsion). Does not use backbone_segments: at every arc length
++    the resultant curvature is sum(EI * kappa) / sum(EI) over the tubes
++    present there, integrated as a planar curve.
++    """
++
++    betas = robot.state.insertions
++    s_end = max(betas)
++    ds = s_end / n
++    s = (np.arange(n) + 0.5) * ds
++
++    num = np.zeros(n)
++    den = np.zeros(n)
++
++    for tube, beta in zip(robot.tubes, betas):
++
++        sigma = s - (beta - tube.length)
++        present = (sigma >= 0) & (sigma <= tube.length)
++
++        in_curve = (
++            (sigma >= tube.length_before_curve)
++            & (
++                sigma
++                <= tube.length_before_curve + tube.curve_length
++            )
++        )
++
++        kappa = np.where(in_curve, tube.precurvature, 0.0)
++
++        num += np.where(present, tube.EI * kappa, 0.0)
++        den += np.where(present, tube.EI, 0.0)
++
++    kappa = np.where(den > 0, num / np.maximum(den, 1e-300), 0.0)
++
++    angle = np.cumsum(kappa * ds) - 0.5 * kappa * ds
++
++    tip = np.array([
++        0.0,
++        -np.sum(np.sin(angle) * ds),
++        np.sum(np.cos(angle) * ds),
++    ])
++
++    alpha = robot.state.rotations[0]
++
++    return rot_z(alpha) @ tip
++
++
++# --------------------------------------------------------------
++# Tube geometry
++# --------------------------------------------------------------
++
++class TestTubeGeometry:
++
++    def test_from_lengths_sums_to_total(self):
++
++        tube = Tube.from_lengths(
++            "t", 0.05, 0.04, 0.03, 20.0, 2e-3, 0.0, nylon
++        )
++
++        assert tube.length == pytest.approx(0.12)
++        assert tube.length_before_curve == pytest.approx(0.05)
++        assert tube.curve_length == pytest.approx(0.04)
++        assert tube.length_after_curve == pytest.approx(0.03)
++
++    def test_default_tube_is_fully_curved(self):
++
++        tube = Tube("t", 0.16, 15.0, 3e-3, 2.8e-3, nylon)
++
++        assert tube.length_before_curve == 0.0
++        assert tube.curve_length == pytest.approx(0.16)
++        assert tube.length_after_curve == pytest.approx(0.0)
++        assert tube.has_uniform_curvature
++
++    def test_straight_tube_is_uniform(self):
++
++        tube = Tube("t", 0.2, 0.0, 1.6e-3, 0.0, nylon)
++
++        assert tube.has_uniform_curvature
++        assert tube.curvature_at(0.1) == 0.0
++
++    def test_curve_only_given_start_runs_to_tip(self):
++
++        tube = Tube(
++            "t", 0.10, 12.0, 2e-3, 0.0, nylon,
++            length_before_curve=0.04,
++        )
++
++        assert tube.curve_length == pytest.approx(0.06)
++        assert tube.length_after_curve == pytest.approx(0.0)
++
++    def test_piecewise_tube_is_not_uniform(self):
++
++        tube = Tube.from_lengths(
++            "t", 0.05, 0.04, 0.03, 20.0, 2e-3, 0.0, nylon
++        )
++
++        assert not tube.has_uniform_curvature
++
++    def test_curvature_profile(self):
++
++        tube = Tube.from_lengths(
++            "t", 0.05, 0.04, 0.03, 20.0, 2e-3, 0.0, nylon
++        )
++
++        assert tube.curvature_at(0.0) == 0.0
++        assert tube.curvature_at(0.049) == 0.0
++        assert tube.curvature_at(0.07) == 20.0
++        assert tube.curvature_at(0.091) == 0.0
++        assert tube.curvature_at(0.12) == 0.0
++
++    def test_stiffness_is_independent_of_curve_profile(self):
++
++        a = Tube("a", 0.12, 20.0, 2e-3, 0.0, nylon)
++        b = Tube.from_lengths(
++            "b", 0.05, 0.04, 0.03, 20.0, 2e-3, 0.0, nylon
++        )
++
++        assert a.EI == b.EI
++        assert a.GJ == b.GJ
++
++    def test_sections_longer_than_tube_rejected(self):
++
++        with pytest.raises(ValueError):
++            Tube(
++                "t", 0.10, 10.0, 2e-3, 0.0, nylon,
++                length_before_curve=0.06, curve_length=0.05,
++            )
++
++    def test_negative_sections_rejected(self):
++
++        with pytest.raises(ValueError):
++            Tube(
++                "t", 0.10, 10.0, 2e-3, 0.0, nylon,
++                length_before_curve=-0.01,
++            )
++
++        with pytest.raises(ValueError):
++            Tube(
++                "t", 0.10, 10.0, 2e-3, 0.0, nylon,
++                length_before_curve=0.02, curve_length=-0.01,
++            )
++
++        with pytest.raises(ValueError):
++            Tube.from_lengths(
++                "t", 0.02, 0.05, -0.01, 10.0, 2e-3, 0.0, nylon
++            )
++
++
++# --------------------------------------------------------------
++# Segmentation
++# --------------------------------------------------------------
++
++class TestSegmentation:
++
++    def test_single_tube_splits_at_curve_boundaries(self):
++
++        tube = Tube.from_lengths(
++            "t", 0.05, 0.04, 0.03, 20.0, 2e-3, 0.0, nylon
++        )
++        robot = ConcentricTubeRobot(
++            [tube], CTRState([0.12], [0.0])
++        )
++
++        segments = backbone_segments(robot)
++
++        assert [
++            (round(s.start, 9), round(s.end, 9)) for s in segments
++        ] == [(0.0, 0.05), (0.05, 0.09), (0.09, 0.12)]
++
++        assert [s.curvatures for s in segments] == [
++            [0.0], [20.0], [0.0]
++        ]
++
++    def test_curve_that_starts_behind_the_base(self):
++
++        tube = Tube.from_lengths(
++            "t", 0.05, 0.04, 0.03, 20.0, 2e-3, 0.0, nylon
++        )
++
++        # Tube occupies s in [-0.03, 0.09]; curve in [0.02, 0.06].
++        robot = ConcentricTubeRobot(
++            [tube], CTRState([0.09], [0.0])
++        )
++
++        segments = backbone_segments(robot)
++
++        assert [s.curvatures for s in segments] == [
++            [0.0], [20.0], [0.0]
++        ]
++        assert segments[0].start == 0.0
++        assert segments[1].start == pytest.approx(0.02)
++
++        # Curve already under way at the base: free backbone starts
++        # mid-curve.
++        robot.state.insertions = [0.05]  # curve in [-0.02, 0.02]
++
++        segments = backbone_segments(robot)
++
++        assert [s.curvatures for s in segments] == [[20.0], [0.0]]
++
++    def test_curve_entirely_behind_base_gives_straight_robot(self):
++
++        tube = Tube.from_lengths(
++            "t", 0.05, 0.04, 0.03, 20.0, 2e-3, 0.0, nylon
++        )
++
++        # beta = 0.03: tube spans s in [-0.09, 0.03], so the curve
++        # occupies [-0.04, 0.00]: none of it is in the free backbone.
++        robot = ConcentricTubeRobot(
++            [tube], CTRState([0.03], [0.0])
++        )
++
++        segments = backbone_segments(robot)
++
++        assert [s.curvatures for s in segments] == [[0.0]]
++
++        bb = solve_forward_kinematics_v2(robot)
++        np.testing.assert_allclose(
++            tip_position(bb), [0.0, 0.0, 0.03], atol=1e-9
++        )
++
++    def test_straight_tube_adds_no_curve_boundaries(self):
++
++        # Zero precurvature: its (meaningless) curve interval would
++        # begin at s = 0.15 - 0.2 + 0.1 = 0.05, inside the free
++        # backbone. It must not create a boundary there.
++        straight = Tube(
++            "s", 0.2, 0.0, 1.6e-3, 0.0, nylon,
++            length_before_curve=0.1,
++        )
++        curved = Tube.from_lengths(
++            "c", 0.03, 0.04, 0.03, 20.0, 3e-3, 2e-3, nylon
++        )
++        robot = ConcentricTubeRobot(
++            [curved, straight],
++            CTRState([0.10, 0.15], [0.0, 0.0]),
++        )
++
++        # "c" spans s in [0, 0.10]; its curve is [0.03, 0.07].
++        (c0, c1), (s0, s1) = curved_intervals(robot)
++
++        assert (c0, c1) == (pytest.approx(0.03), pytest.approx(0.07))
++        assert s0 == s1
++
++        starts = [
++            round(s.start, 9) for s in backbone_segments(robot)
++        ]
++
++        assert starts == [0.0, 0.03, 0.07, 0.10]
++
++    def test_coincident_boundaries_are_merged(self):
++
++        tube = Tube.from_lengths(
++            "t", 0.05, 0.04, 0.03, 20.0, 2e-3, 0.0, nylon
++        )
++        # curve start of the tube coincides with s = 0 exactly
++        robot = ConcentricTubeRobot(
++            [tube], CTRState([0.07], [0.0])
++        )
++
++        segments = backbone_segments(robot)
++
++        assert all(s.end - s.start > 1e-9 for s in segments)
++
++    def test_legacy_tubes_keep_original_segmentation(self):
++
++        outer = Tube("o", 0.16, 15.0, 3e-3, 2.8e-3, nylon)
++        middle = Tube("m", 0.18, 10.0, 2e-3, 1.8e-3, nylon)
++        inner = Tube("i", 0.20, 0.0, 1.6e-3, 0.0, nylon)
++
++        robot = ConcentricTubeRobot(
++            [outer, middle, inner],
++            CTRState([0.10, 0.12, 0.14], [0.0, 0.0, 0.0]),
++        )
++
++        segments = backbone_segments(robot)
++
++        assert [
++            (round(s.start, 9), round(s.end, 9)) for s in segments
++        ] == [(0.0, 0.10), (0.10, 0.12), (0.12, 0.14)]
++
++        assert [s.curvatures for s in segments] == [
++            [15.0, 10.0, 0.0], [10.0, 0.0], [0.0]
++        ]
++
++    def test_segment_requires_curvatures_for_piecewise_tube(self):
++
++        tube = Tube.from_lengths(
++            "t", 0.05, 0.04, 0.03, 20.0, 2e-3, 0.0, nylon
++        )
++
++        with pytest.raises(ValueError):
++            Segment(0.0, 0.1, [tube])
++
++    def test_segment_curvature_length_checked(self):
++
++        tube = Tube("t", 0.1, 5.0, 2e-3, 0.0, nylon)
++
++        with pytest.raises(ValueError):
++            Segment(0.0, 0.1, [tube], curvatures=[1.0, 2.0])
++
++    def test_segment_defaults_to_tube_precurvature(self):
++
++        tube = Tube("t", 0.1, 5.0, 2e-3, 0.0, nylon)
++
++        assert Segment(0.0, 0.1, [tube]).curvatures == [5.0]
++
++
++# --------------------------------------------------------------
++# Forward mechanics
++# --------------------------------------------------------------
++
++class TestForwardMechanics:
++
++    @pytest.mark.parametrize("alpha", [0.0, 0.7, -2.0])
++    def test_single_tube_matches_closed_form(self, alpha):
++
++        l1, lc, l3, kappa = 0.05, 0.04, 0.03, 20.0
++
++        tube = Tube.from_lengths(
++            "t", l1, lc, l3, kappa, 2e-3, 0.0, nylon
++        )
++        robot = ConcentricTubeRobot(
++            [tube], CTRState([l1 + lc + l3], [alpha])
++        )
++
++        phi = kappa * lc
++
++        expected = np.array([
++            0.0,
++            -((1 - np.cos(phi)) / kappa + l3 * np.sin(phi)),
++            l1 + np.sin(phi) / kappa + l3 * np.cos(phi),
++        ])
++
++        tip = tip_position(solve_forward_kinematics_v2(robot))
++
++        np.testing.assert_allclose(
++            tip, rot_z(alpha) @ expected, atol=POS_TOL
++        )
++
++    def test_partially_inserted_single_tube(self):
++
++        l1, lc, l3, kappa = 0.05, 0.04, 0.03, 20.0
++
++        tube = Tube.from_lengths(
++            "t", l1, lc, l3, kappa, 2e-3, 0.0, nylon
++        )
++
++        # beta = 0.06: tube spans s in [-0.06, 0.06]; the curve
++        # occupies s in [-0.01, 0.03]; straight tail [0.03, 0.06].
++        robot = ConcentricTubeRobot(
++            [tube], CTRState([0.06], [0.0])
++        )
++
++        arc = 0.03
++        phi = kappa * arc
++
++        expected = np.array([
++            0.0,
++            -((1 - np.cos(phi)) / kappa + l3 * np.sin(phi)),
++            np.sin(phi) / kappa + l3 * np.cos(phi),
++        ])
++
++        tip = tip_position(solve_forward_kinematics_v2(robot))
++
++        np.testing.assert_allclose(tip, expected, atol=POS_TOL)
++
++    @pytest.mark.parametrize(
++        "insertions",
++        [
++            [0.10, 0.13, 0.17],
++            [0.05, 0.12, 0.18],
++            [0.14, 0.15, 0.18],
++        ],
++    )
++    def test_three_tubes_equal_rotation_match_reference(
++        self,
++        insertions,
++    ):
++
++        robot = ConcentricTubeRobot(
++            three_piecewise_tubes(),
++            CTRState(insertions, [0.4, 0.4, 0.4]),
++        )
++
++        tip = tip_position(solve_forward_kinematics_v2(robot))
++
++        np.testing.assert_allclose(
++            tip,
++            reference_tip_equal_rotations(robot),
++            atol=POS_TOL,
++        )
++
++    def test_curve_length_changes_the_shape(self):
++
++        short = Tube.from_lengths(
++            "t", 0.05, 0.02, 0.05, 20.0, 2e-3, 0.0, nylon
++        )
++        long = Tube.from_lengths(
++            "t", 0.05, 0.05, 0.02, 20.0, 2e-3, 0.0, nylon
++        )
++
++        tips = []
++
++        for tube in (short, long):
++            robot = ConcentricTubeRobot(
++                [tube], CTRState([0.12], [0.0])
++            )
++            tips.append(
++                tip_position(solve_forward_kinematics_v2(robot))
++            )
++
++        assert abs(tips[0][1]) < abs(tips[1][1])
++
++    def test_legacy_uniform_tube_equals_explicit_full_curve(self):
++
++        legacy = Tube("t", 0.12, 20.0, 2e-3, 0.0, nylon)
++        explicit = Tube.from_lengths(
++            "t", 0.0, 0.12, 0.0, 20.0, 2e-3, 0.0, nylon
++        )
++
++        tips = []
++
++        for tube in (legacy, explicit):
++            robot = ConcentricTubeRobot(
++                [tube], CTRState([0.10], [0.3])
++            )
++            tips.append(
++                tip_position(solve_forward_kinematics_v2(robot))
++            )
++
++        np.testing.assert_array_equal(tips[0], tips[1])
++
++    def test_straight_proximal_section_is_a_pure_offset(self):
++        """
++        Lengthening the straight section in front of the curve moves
++        the curve distally without changing its shape: the tip of a
++        single tube moves along z by the added length.
++        """
++
++        tips = []
++
++        for l1 in (0.03, 0.05):
++            tube = Tube.from_lengths(
++                "t", l1, 0.04, 0.03, 20.0, 2e-3, 0.0, nylon
++            )
++            robot = ConcentricTubeRobot(
++                [tube], CTRState([tube.length], [0.0])
++            )
++            tips.append(
++                tip_position(solve_forward_kinematics_v2(robot))
++            )
++
++        np.testing.assert_allclose(
++            tips[1] - tips[0], [0.0, 0.0, 0.02], atol=POS_TOL
++        )
++
++
++# --------------------------------------------------------------
++# Torsion
++# --------------------------------------------------------------
++
++class TestTorsion:
++
++    @pytest.mark.parametrize(
++        "rotations",
++        [
++            [0.5, -1.0, 2.0],
++            [3.0, 0.0, -3.0],
++            [0.0, 1.5, 0.0],
++        ],
++    )
++    def test_free_tip_condition_is_satisfied(self, rotations):
++
++        robot = ConcentricTubeRobot(
++            three_piecewise_tubes(),
++            CTRState([0.10, 0.14, 0.18], rotations),
++        )
++
++        bb = solve_forward_kinematics_v2(robot)
++
++        residual = torsion_shooting_residual(
++            bb.torsion_solution.base_theta_dot, robot
++        )
++
++        assert np.abs(residual).max() < 1e-6
++
++    def test_torsion_is_continuous_across_curve_boundaries(self):
++
++        robot = ConcentricTubeRobot(
++            three_piecewise_tubes(),
++            CTRState([0.10, 0.14, 0.18], [0.5, -1.0, 2.0]),
++        )
++
++        bb = solve_forward_kinematics_v2(robot)
++
++        solutions = bb.torsion_solution.segments
++
++        for left, right in zip(solutions[:-1], solutions[1:]):
++
++            y_end = left.ivp_solution.y[:, -1]
++            y_start = right.ivp_solution.y[:, 0]
++
++            for k, tube in enumerate(right.segment.active_tubes):
++
++                j = left.segment.active_tubes.index(tube)
++
++                # theta and theta' both continuous for a tube that
++                # continues across the boundary.
++                np.testing.assert_allclose(
++                    y_start[2 * k: 2 * k + 2],
++                    y_end[2 * j: 2 * j + 2],
++                    atol=1e-12,
++                )
++
++    def test_tube_is_rigid_in_its_distal_straight_section(self):
++        """
++        A tube that is straight at its tip carries no twisting
++        moment there, so the free-tip condition forces it not to
++        twist along the straight tail: theta is constant over it.
++        """
++
++        robot = ConcentricTubeRobot(
++            three_piecewise_tubes(),
++            CTRState([0.10, 0.14, 0.18], [0.5, -1.0, 2.0]),
++        )
++
++        bb = solve_forward_kinematics_v2(robot)
++
++        inner_tail_start = 0.18 - 0.040
++
++        for sol in bb.torsion_solution.segments:
++
++            seg = sol.segment
++
++            if seg.start < inner_tail_start - 1e-9:
++                continue
++
++            inner_index = seg.active_tubes.index(
++                robot.tubes[2]
++            )
++
++            theta_dot = sol.ivp_solution.y[2 * inner_index + 1]
++
++            # The shooting solve uses scipy's default ODE tolerances,
++            # so theta' at the tip is zero to roughly 1e-5 rad/m.
++            np.testing.assert_allclose(theta_dot, 0.0, atol=1e-4)
++
++
++# --------------------------------------------------------------
++# Control path
++# --------------------------------------------------------------
++
++class TestControlPath:
++
++    def test_jacobian_is_finite_and_full_rank(self):
++
++        robot = ConcentricTubeRobot(
++            three_piecewise_tubes(),
++            CTRState([0.10, 0.14, 0.18], [0.5, -1.0, 2.0]),
++        )
++
++        J = numerical_position_jacobian_v2(robot)
++
++        assert J.shape == (3, 6)
++        assert np.all(np.isfinite(J))
++        assert np.linalg.matrix_rank(J) == 3
++
++    def test_resolved_rate_step_moves_tip_as_commanded(self):
++
++        # Interior configuration: no insertion limit is active, so the
++        # constrained step equals the unconstrained one.
++        robot = ConcentricTubeRobot(
++            three_piecewise_tubes(),
++            CTRState([0.09, 0.12, 0.15], [0.5, -1.0, 2.0]),
++        )
++
++        before = tip_position(solve_forward_kinematics_v2(robot))
++
++        dx = np.array([0.0, 0.0, 1e-3])
++
++        # Same sequence as the ROS simulator: resolved-rate step,
++        # then insertion constraints.
++        dq = constrain_joint_step(
++            robot,
++            resolved_rate_step_v2(robot, dx),
++        )
++
++        n = len(robot.tubes)
++
++        robot.state.insertions = (
++            np.array(robot.state.insertions) + dq[:n]
++        ).tolist()
++        robot.state.rotations = (
++            np.array(robot.state.rotations) + dq[n:]
++        ).tolist()
++
++        robot.validate_configuration()
++
++        after = tip_position(solve_forward_kinematics_v2(robot))
++
++        # Linearization error only: within 10 % of the commanded step.
++        assert np.linalg.norm((after - before) - dx) < (
++            0.1 * np.linalg.norm(dx)
++        )
++
++
++# --------------------------------------------------------------
++# V1 pipeline guard
++# --------------------------------------------------------------
++
++def test_v1_pipeline_rejects_piecewise_tubes():
++
++    robot = ConcentricTubeRobot(
++        three_piecewise_tubes(),
++        CTRState([0.10, 0.14, 0.18], [0.0, 0.0, 0.0]),
++    )
++
++    with pytest.raises(NotImplementedError):
++        solve_forward_kinematics(robot)
+-- 
+2.43.0
