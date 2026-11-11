@@ -1,5 +1,13 @@
 ## Progression Notes Doc
-## Physics-only model (ctr-sim)
+
+## Physics-only model (ctr-sim2) (new)
+A physics only model based off of the ctr-sim framework with minor changes, with the most profound update being taking into account pre and post curvature tube length, for modeling real tubes. 
+
+The code is included under `ctr-sim2`, and it can be installed by running, `python3 -m pip install --no-build-isolation -e .`. 
+
+The main teleoperation script is `ctr-controlv3.py`. A preview of the simulated tubes also launches beside the "control" window.
+
+## Physics-only model (ctr-sim) (old)
 A physics only Cartesian control model using the ctr-sim framework ([original git repo](https://github.com/JackyP1937/ctr-sim))
 
 Code can be found under `ctr-sim`, and the main entrance script is `ctr-controlv1.py` or `ctr-controlv2.py`. It is necessary to install the python packages in `requirements.txt` and to also build and install the ctr-sim framework in that same directory. More info to install ctr-sim is in the `README.MD` in the original git repo. `ctr-sim` is NOT included in this github repo.
