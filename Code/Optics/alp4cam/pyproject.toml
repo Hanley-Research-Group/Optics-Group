@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alp4cam"
+version = "0.1.0"
+description = "ALP-4.2 DMD binary pattern upload tools"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "Pillow",
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+dmd = ["ALP4lib"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+alp4cam-patterns = "alp4cam.cli.make_patterns:main"
+alp4cam-load = "alp4cam.cli.load_dmd:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["alp4cam*"]
+exclude = ["dmdcam*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

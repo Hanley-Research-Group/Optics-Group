@@ -1,0 +1,15 @@
+logging:
+  log_level: INFO
+  console: true
+  file: true
+
+DMD:
+  version: "4.2"
+  library_dir: null
+  picture_time_us: 10000
+  duration_s: 0
+  once: false
+
+app:
+  output_dir: data
+  pattern_dir: data/patterns

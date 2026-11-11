@@ -1,0 +1,25 @@
+2026-11-04 16:09:08,745 INFO Loaded config for pattern generation (type=hadamard, log_level=INFO)
+2026-11-04 16:09:08,745 INFO Generating Hadamard pattern set with mode_side=16 and macro=2
+2026-11-04 16:09:08,871 INFO Generated 512 patterns in /private/var/folders/yc/khwbqkqx1ynfqmmqpnz3hj080000gn/T/pytest-of-dagmaweahaileslassie/pytest-21/test_cli_make_patterns_generat0/generated
+2026-11-04 16:09:08,873 INFO Loaded config for pattern generation (type=hadamard, log_level=INFO)
+2026-11-04 16:09:08,873 INFO Generating Hadamard pattern set with mode_side=8 and macro=1
+2026-11-04 16:09:08,887 INFO Generated 64 patterns in /private/var/folders/yc/khwbqkqx1ynfqmmqpnz3hj080000gn/T/pytest-of-dagmaweahaileslassie/pytest-21/test_cli_make_patterns_emits_l0/generated
+2026-11-04 16:09:08,923 INFO Loaded config for pattern generation (type=hadamard, log_level=INFO)
+2026-11-04 16:09:08,924 INFO Generating Hadamard pattern set with mode_side=8 and macro=1
+2026-11-04 16:09:08,938 INFO Generated 64 patterns in /private/var/folders/yc/khwbqkqx1ynfqmmqpnz3hj080000gn/T/pytest-of-dagmaweahaileslassie/pytest-21/test_cli_make_patterns_creates0/data/patterns/hadamard_20261104_160908
+2026-11-04 16:09:23,394 INFO Loaded config for pattern generation (type=hadamard, log_level=INFO)
+2026-11-04 16:09:23,394 INFO Generating Hadamard pattern set with mode_side=16 and macro=2
+2026-11-04 16:09:23,513 INFO Generated 512 patterns in /private/var/folders/yc/khwbqkqx1ynfqmmqpnz3hj080000gn/T/pytest-of-dagmaweahaileslassie/pytest-22/test_cli_make_patterns_generat0/generated
+2026-11-04 16:09:23,515 INFO Loaded config for pattern generation (type=hadamard, log_level=INFO)
+2026-11-04 16:09:23,515 INFO Generating Hadamard pattern set with mode_side=8 and macro=1
+2026-11-04 16:09:23,526 INFO Generated 64 patterns in /private/var/folders/yc/khwbqkqx1ynfqmmqpnz3hj080000gn/T/pytest-of-dagmaweahaileslassie/pytest-22/test_cli_make_patterns_emits_l0/generated
+2026-11-04 16:09:23,528 INFO Loaded config for pattern generation (type=hadamard, log_level=INFO)
+2026-11-04 16:09:23,528 INFO Generating Hadamard pattern set with mode_side=8 and macro=1
+2026-11-04 16:09:23,539 INFO Generated 64 patterns in /private/var/folders/yc/khwbqkqx1ynfqmmqpnz3hj080000gn/T/pytest-of-dagmaweahaileslassie/pytest-22/test_cli_make_patterns_creates0/data/patterns/hadamard_20261104_160923
+2026-11-04 16:09:33,743 INFO Loaded config for pattern generation (type=hadamard, log_level=INFO)
+2026-11-04 16:09:33,743 INFO Generating Hadamard pattern set with mode_side=32 and macro=2
+2026-11-04 16:09:34,232 INFO Generated 2048 patterns in /Users/dagmaweahaileslassie/Documents/MS/Thesis/Optics-Group/Code/Optics/alp4cam/data/patterns/hadamard_20261104_160933
+2026-11-04 16:09:34,350 INFO Loaded DMD config with picture_time_us=1000, duration=0, once=True
+2026-11-04 16:12:24,739 INFO Loaded config for pattern generation (type=test, log_level=INFO)
+2026-11-04 16:12:24,739 INFO Generating test patterns with side=32
+2026-11-04 16:12:24,748 INFO Generated 4 patterns in /Users/dagmaweahaileslassie/Documents/MS/Thesis/Optics-Group/Code/Optics/alp4cam/data/patterns/test_20261104_161224
